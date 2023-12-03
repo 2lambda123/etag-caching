@@ -2,12 +2,98 @@ name: Isolated Release
 on:
   workflow_dispatch:
 
+# Determine Release Version (project code)
+# Create Release Commit (release-workflow-code as GitHub App) - includes GitHub Actor in commit message
+#   * https://github.com/orgs/community/discussions/50055
+# ... wait on standard tests to run?!
+# Create artifacts (project code)
+# Sign artifacts (release-workflow-code as GitHub App)
+#  * Create Release Tag, with artifact hashes in tag message
+#  * Create post-Release Commit with post-release version
+# Release artifacts to Maven (release-workflow-code as GitHub App)
+# Create GitHub Release (release-workflow-code as GitHub App)
+
 jobs:
+  defaults:
+    runs-on: ubuntu-latest
+  generate-version-update-commits:
+    name: Generate Version Update Commits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-java@v3
+        with:
+          distribution: corretto
+          java-version: 17
+          cache: sbt
+      - name: Use sbt-release to construct version.sbt updates
+        run: |
+          sbt release
+          cd `mktemp -d`
+          git clone --bare $GITHUB_WORKSPACE repo-with-unsigned-version-update-commits.git
+          rm -Rf $GITHUB_WORKSPACE
+          mv repo-with-unsigned-version-update-commits.git $GITHUB_WORKSPACE
+      - uses: actions/cache/save@v3
+        with:
+          path: repo-with-unsigned-version-update-commits.git
+          key: repo-with-unsigned-version-update-commits-${{ github.run_id }}-${{ github.run_attempt }}
+
+  push-release-commit:
+    name: Push Release Commit
+    needs: generate-version-update-commits
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          path: repo
+      - uses: actions/cache/restore@v3
+        with:
+          path: repo-with-unsigned-version-update-commits.git
+          key: repo-with-unsigned-version-update-commits-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+      - uses: actions/setup-java@v3
+        with:
+          java-version: 17
+          gpg-private-key: ${{ secrets.AUTOMATED_MAVEN_RELEASE_PGP_SECRET }}
+      - name: Create commit
+        run: |
+          key_fingerprint_and_email=$(gpg2 --list-secret-keys --list-options show-only-fpr-mbox)
+          key_fingerprint=$(echo $key_fingerprint_and_email | awk '{print $1}')
+          key_email=$(echo $key_fingerprint_and_email | awk '{print $2}')
+          
+          cd repo-with-unsigned-version-update-commits.git
+          release_tag=$(git describe --tags --abbrev=0)
+          
+          cd ../repo
+          git config user.email "$key_email"
+          git config user.name "@$GITHUB_ACTOR using Guardian Automated Maven Release"
+          git config commit.gpgsign true
+          
+          git remote add unsigned ../repo-with-unsigned-version-update-commits.git
+          git fetch unsigned
+          git rebase unsigned/main --exec 'git commit --amend --no-edit --reset-author'
+          
+          release_commit_id=$(git rev-parse HEAD^)
+          
+          {
+            "release_tag=$release_tag"
+            "key_fingerprint=$key_fingerprint"
+            "key_email=$key_email"
+            "release_commit_id=$release_commit_id"
+          } >> $GITHUB_OUTPUT
+          
+          git log --oneline -n3
+          git push
+
   create-artifacts:
     name: Create unsigned artifacts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: ${{ steps.push-release-commit.outputs.release_commit_id }}
       - uses: actions/setup-java@v3
         with:
           distribution: corretto
@@ -87,3 +173,9 @@ jobs:
       - name: Release
         run: |
           sbt "sonatypeBundleRelease"
+      - name: Create Github Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.determine-release-version.outputs.RELEASE_TAG }}
+        run: |
+          gh release create RELEASE_TAG --generate-notes --verify-tag
